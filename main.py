@@ -106,45 +106,47 @@ def get_icon_for_state(state: str): # state can be "idle", "recording", "process
     else: return create_dummy_icon(color1='blue', color2='lightblue', shape='ellipse') # idle
 
 # --- System Tray Menu Callbacks ---
-def on_toggle_listening(icon, item):
+def on_toggle_listening(icon, item): # Tray menu callback
     with app_state_instance.lock:
         app_state_instance.listening_enabled = not app_state_instance.listening_enabled
         if app_state_instance.listening_enabled:
             app_state_instance.status_message = "Idle - Listening"
-            hotkey_manager_instance.start() # Re-start listener if it was fully stopped
+            hotkey_manager_instance.start() # This will open/ensure audio stream is open
         else:
             app_state_instance.status_message = "Idle - Not Listening"
-            # hotkey_manager_instance.stop() # Or just let listener check app_state.listening_enabled
+            hotkey_manager_instance.stop() # This will stop listener AND close audio stream
     print(f"System Tray: Listening toggled to {app_state_instance.listening_enabled}")
-    # Tray icon/title will be updated by the tray_icon_updater thread
 
-def on_exit_app(icon_obj, item): # Renamed icon to icon_obj to avoid conflict if any
+def on_exit_app(icon_obj, item): # Tray menu callback
     print("System Tray: Exit requested by user.")
     app_state_instance.update_status("Exiting...", is_recording=False)
-    app_state_instance.exit_requested = True
-    app_state_instance.listening_enabled = False # Ensure no new actions
+    app_state_instance.exit_requested = True # Signals all threads
+    app_state_instance.listening_enabled = False 
     
     if hotkey_manager_instance:
-        hotkey_manager_instance.stop()
+        hotkey_manager_instance.stop() # This will also close the audio stream
     
-    if global_pystray_icon: # Use the global reference
+    if global_pystray_icon: 
         global_pystray_icon.stop()
     print("Main: pystray icon stop called.")
 
-
+# --- Main Application ---
 # --- Main Application ---
 if __name__ == "__main__":
     print("Starting Background Voice-to-Text Application (Simplified Version)...")
 
     # Initialize components
     # app_state_instance is already global
-    # audio_recorder_instance is already global
-    hotkey_manager_instance = HotkeyManager(app_state_instance, audio_recorder_instance) # Pass tray_icon_ref later
+    # audio_recorder_instance is already global (or defined here if preferred)
+    if 'audio_recorder_instance' not in globals(): # Ensure it's defined if not already global
+        audio_recorder_instance = AudioRecorder(temp_filename="temp_voice_input.wav")
+    
+    hotkey_manager_instance = HotkeyManager(app_state_instance, audio_recorder_instance)
 
-    # Setup and run the system tray icon
+    # --- Define the menu FIRST ---
     menu = PystrayMenu(
         PystrayMenuItem(
-            'Enable Hotkeys', # Changed label for clarity
+            'Enable Hotkeys', 
             on_toggle_listening,
             checked=lambda item: app_state_instance.listening_enabled, # Dynamic check
             radio=True # Makes it look like a toggle
@@ -153,17 +155,25 @@ if __name__ == "__main__":
         PystrayMenuItem('Exit Application', on_exit_app)
     )
 
-    initial_icon_image = get_icon_for_state("idle")
-    global_pystray_icon = PystrayIcon("Voice2Text Simplified", initial_icon_image, "Voice-to-Text: Idle", menu)
+    # --- THEN create the icon using the defined menu ---
+    initial_icon_image = get_icon_for_state("idle") 
+    if not app_state_instance.listening_enabled: # Check initial state for icon
+        initial_icon_image = get_icon_for_state("disabled")
+        
+    global_pystray_icon = PystrayIcon(
+        "Voice2Text Simplified", 
+        initial_icon_image, 
+        "Voice-to-Text: Initializing...", # Initial tooltip
+        menu  # Now 'menu' is defined
+    )
     
-    # Pass tray icon ref to hotkey_manager AFTER it's created (for direct updates, if any)
-    # hotkey_manager_instance.tray_icon = global_pystray_icon # If direct update needed
-                                                            # Current design uses separate updater thread
+    # Start the hotkey listener thread 
+    if app_state_instance.listening_enabled:
+        hotkey_manager_instance.start() 
+    else: 
+        # audio_recorder_instance.close_stream() # This might be too aggressive if HKM manages it
+        app_state_instance.status_message = "Idle - Not Listening (Hotkeys Disabled)"
 
-    # Start the hotkey listener thread
-    hotkey_manager_instance.start()
-
-    # Start the tray icon updater thread
     tray_updater_thread = threading.Thread(
         target=tray_icon_updater, 
         args=(global_pystray_icon, app_state_instance), 
@@ -172,35 +182,41 @@ if __name__ == "__main__":
     tray_updater_thread.start()
     
     print("System Tray Icon and Hotkey Manager configured. Application running...")
-    app_state_instance.update_status("Idle - Listening", is_recording=False) # Initial status
+    # Set initial status message after HKM start might have opened stream
+    if app_state_instance.listening_enabled:
+        app_state_instance.update_status("Idle - Listening")
+    else:
+        app_state_instance.update_status("Idle - Not Listening (Hotkeys Disabled)")
+
 
     try:
-        global_pystray_icon.run() # This blocks the main thread
+        global_pystray_icon.run() 
     except KeyboardInterrupt:
         print("\nMain: KeyboardInterrupt received. Shutting down.")
-        on_exit_app(None, None) # Call exit handler
+        on_exit_app(None, None) 
     except Exception as e:
         print(f"Main: An error occurred with pystray: {e}")
         import traceback
         traceback.print_exc()
-        on_exit_app(None, None) # Attempt graceful shutdown
+        on_exit_app(None, None) 
     finally:
-        print("Main: Application final shutdown sequence.")
-        # Ensure exit_requested is True to signal all threads
-        if not app_state_instance.exit_requested:
-             app_state_instance.exit_requested = True
-
-        if hotkey_manager_instance and hotkey_manager_instance.listener_thread and hotkey_manager_instance.listener_thread.is_alive():
+        print("Application shutting down...")
+        if not app_state_instance.exit_requested: 
+            app_state_instance.exit_requested = True
+            app_state_instance.listening_enabled = False
+            if hotkey_manager_instance:
+                hotkey_manager_instance.stop()
+        
+        if hasattr(hotkey_manager_instance, 'listener_thread') and hotkey_manager_instance.listener_thread and hotkey_manager_instance.listener_thread.is_alive():
             print("Main: Waiting for HotkeyManager thread to join...")
             hotkey_manager_instance.listener_thread.join(timeout=2.0)
             if hotkey_manager_instance.listener_thread.is_alive():
                 print("Main WARN: HotkeyManager thread did not join in time.")
         
-        if tray_updater_thread.is_alive():
+        if tray_updater_thread.is_alive(): # tray_updater_thread is defined inside __main__
             print("Main: Waiting for tray_updater_thread to join...")
-            tray_updater_thread.join(timeout=1.0) # It checks exit_requested, so should exit
+            tray_updater_thread.join(timeout=1.0) 
             if tray_updater_thread.is_alive():
                  print("Main WARN: Tray updater thread did not join in time.")
 
         print("Main: Application exited.")
-        # sys.exit(0) # pystray.stop() should allow program to exit; explicit exit can be added if needed

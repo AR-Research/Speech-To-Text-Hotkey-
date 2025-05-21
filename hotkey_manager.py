@@ -26,33 +26,18 @@ class HotkeyManager:
     def __init__(self, app_state: AppState, audio_recorder: AudioRecorder, tray_icon_ref=None):
         self.app_state = app_state
         self.audio_recorder = audio_recorder
-        self.listener_thread = None
-        self.pynput_listener = None
+        self.listener_thread: threading.Thread | None = None  # <<< INITIALIZE HERE
+        self.pynput_listener: keyboard.Listener | None = None # Also good to initialize with type hint
         self.currently_pressed_keys = set()
-        self._hotkey_active_and_recording = False # State to manage if we are in a hotkey-triggered recording session
-        self.tray_icon = tray_icon_ref # pystray.Icon object
+        self._hotkey_active_and_recording = False 
+        self.tray_icon = tray_icon_ref # pystray.Icon object (passed from main, currently not used in HotkeyManager)
+        self.audio_recorder = audio_recorder # This is our pre-warmed capable recorder
 
-    def _update_tray_feedback(self):
-        """Update tray icon and title based on app_state."""
-        if self.tray_icon:
-            # Assuming get_icon_for_state is available or logic is here
-            # This function would ideally be in main.py and passed as a callback
-            # For now, direct update attempt (pystray is usually okay with icon/title from threads)
-            from main import get_icon_for_state # Circular import risk, better to pass callback
-            
-            current_status = "idle"
-            if not self.app_state.listening_enabled:
-                current_status = "disabled"
-            elif self.app_state.is_recording:
-                current_status = "recording"
-            elif "processing..." in self.app_state.status_message.lower(): # Check for processing state
-                current_status = "processing"
-            elif "error" in self.app_state.status_message.lower():
-                current_status = "error_generic" # Or more specific error states
-
-            self.tray_icon.icon = get_icon_for_state(current_status)
-            self.tray_icon.title = f"Voice-to-Text: {self.app_state.status_message}"
-
+    def _play_start_beep_async(self):
+        try:
+            winsound.Beep(1000, 100) 
+        except Exception as e:
+            print(f"HotkeyManager: Error in _play_start_beep_async: {e}")
 
     def _on_press(self, key):
         if not self.app_state.listening_enabled or self.app_state.exit_requested:
@@ -66,97 +51,98 @@ class HotkeyManager:
 
         if HOTKEY_COMBINATION_PRESS.issubset(self.currently_pressed_keys):
             if not self._hotkey_active_and_recording: 
-                print("HotkeyManager: Ctrl+Alt PRESSED and HELD.")
+                time_combo_confirmed = time.perf_counter()
+                print(f"HotkeyManager: Ctrl+Alt PRESSED and HELD. (Combo confirmed at {time_combo_confirmed:.4f})")
                 self._hotkey_active_and_recording = True
                 
-                # --- Play sound to indicate recording start ---
-                try:
-                    # Option A: Simple beep (frequency in Hz, duration in milliseconds)
-                    winsound.Beep(1000, 150) # Example: 1000 Hz for 150 ms
-                    # You can experiment with different frequencies and durations
-                    # e.g., winsound.Beep(800, 100) for a softer/shorter beep
-                except Exception as e_sound:
-                    print(f"HotkeyManager: Error playing start sound: {e_sound}")
-                # --- End of sound playback ---
+                # 1. Start "recording" (which is now just flipping a flag, should be very fast)
+                time_before_start_recording = time.perf_counter()
+                record_started_successfully = self.audio_recorder.start_recording()
+                time_after_start_recording = time.perf_counter()
+                print(f"DEBUG_TIMING: Actual 'start_recording' call took: {(time_after_start_recording - time_before_start_recording)*1000:.2f} ms")
 
-                self.app_state.set_recording(True) 
+                if record_started_successfully:
+                    # 2. Play beep (asynchronously) to signal actual data capture has begun
+                    beep_thread = threading.Thread(target=self._play_start_beep_async)
+                    beep_thread.daemon = True 
+                    beep_thread.start()
+                    
+                    self.app_state.set_recording(True) # Update global state
 
-                try:
-                    active_window = pyautogui.getActiveWindow()
-                    title = active_window.title if active_window else None
-                    self.app_state.set_active_window(title)
-                    print(f"HotkeyManager: Active window on press: '{title}'")
-                except Exception as e:
-                    print(f"HotkeyManager: Error getting active window: {e}")
-                    self.app_state.set_active_window(None)
-                
-                self.audio_recorder.start_recording()
+                    # 3. Get active window (can still be here, relatively fast)
+                    try:
+                        active_window = pyautogui.getActiveWindow()
+                        title = active_window.title if active_window else None
+                        self.app_state.set_active_window(title)
+                        print(f"HotkeyManager: Active window on press: '{title}'")
+                    except Exception as e:
+                        print(f"HotkeyManager: Error getting active window: {e}")
+                        self.app_state.set_active_window(None)
+                else:
+                    print("HotkeyManager: Failed to start audio recording process.")
+                    self.app_state.update_status("Error: Failed to start recording.", is_recording=False)
+                    self._hotkey_active_and_recording = False # Reset if failed to start
         return True
 
     def _on_release(self, key):
         if self.app_state.exit_requested:
-            return False # Stop listener if exiting
+            return False 
 
-        # Remove released key from the set
+        original_hotkey_active_and_recording = self._hotkey_active_and_recording
+
         if key in self.currently_pressed_keys:
             self.currently_pressed_keys.remove(key)
-            print(f"HotkeyManager: Released {key}. Currently pressed: {self.currently_pressed_keys}")
+            # print(f"HotkeyManager: Released {key}. Currently pressed: {self.currently_pressed_keys}") # Can be noisy
 
-        # If one of the hotkey components is released AND we were recording due to hotkey
-        if key in HOTKEY_PARTIAL_RELEASE and self._hotkey_active_and_recording:
-            # Check if the hotkey combo is effectively broken
-            # This happens if NOT ALL required keys are still in currently_pressed_keys
-            # A simpler check: if any of the *original* hotkey set is released, sequence ends.
-            # We initiated recording when HOTKEY_COMBINATION_PRESS was met.
-            # So, if any key from that set is released, the "hold" is over.
-            
+        # Only process release if we were actively recording due to hotkey
+        # and one of the main hotkey components is released
+        if key in HOTKEY_PARTIAL_RELEASE and original_hotkey_active_and_recording:
+            # Check if the defining combination is truly broken (e.g. if alt OR ctrl is lifted from a ctrl+alt combo)
+            # For simplicity, any monitored key release while active triggers stop.
             print(f"HotkeyManager: Monitored key {key} RELEASED while recording was active.")
+            
             self.app_state.set_recording(False) # is_recording=False, status="Processing..."
-            # self._update_tray_feedback()
-
-
-            audio_file = self.audio_recorder.stop_recording()
-            self._hotkey_active_and_recording = False # Reset for next hotkey press
-            # self.currently_pressed_keys.clear() # Clear all, as the combo is broken. Or let press manage.
-
+            
+            audio_file = self.audio_recorder.stop_recording() # Stops frame collection & saves
+            self._hotkey_active_and_recording = False # Reset for next hotkey press cycle
+            
             active_window_title_for_typing = self.app_state.active_window_title_on_press
             self.app_state.set_active_window(None) # Clear it after use
 
+            final_status_message = "Error: Audio processing failed (no file)." # Default status
+
             if audio_file:
                 self.app_state.update_status(f"Transcribing {os.path.basename(audio_file)}...", is_recording=False)
-                # self._update_tray_feedback()
+                transcribed_text = transcribe_audio_file(audio_file) # This can be an error string or actual text
 
-                transcribed_text = transcribe_audio_file(audio_file)
-                
                 # Clean up temporary audio file
                 try:
                     if os.path.exists(audio_file):
                         os.remove(audio_file)
                         print(f"HotkeyManager: Deleted temporary audio file: {audio_file}")
-                except Exception as e:
-                    print(f"HotkeyManager ERROR: Could not delete temp audio file {audio_file}: {e}")
+                except Exception as e_del:
+                    print(f"HotkeyManager ERROR: Could not delete temp audio file {audio_file}: {e_del}")
 
                 if transcribed_text and not transcribed_text.lower().startswith("error:"):
-                    self.app_state.update_status(f"Typing: '{transcribed_text[:30]}...'")
-                    # self._update_tray_feedback()
-                    time.sleep(0.1) # Brief pause before typing
-                    success = insert_text_at_cursor(transcribed_text, active_window_title_for_typing)
-                    if success:
-                        self.app_state.update_status("Text inserted successfully.")
-                    else:
-                        self.app_state.update_status("Error inserting text.")
-                else:
-                    error_message = transcribed_text if transcribed_text else "Transcription failed: Unknown error."
-                    self.app_state.update_status(error_message)
-            else:
-                self.app_state.update_status("Audio recording failed.")
+                    text_to_type = transcribed_text.strip()
+                    if text_to_type: 
+                        text_to_type_with_space = text_to_type + " " 
+                        self.app_state.update_status(f"Typing: '{text_to_type[:30].strip()}...'")
+                        time.sleep(0.1) 
+                        insertion_success = insert_text_at_cursor(text_to_type_with_space, active_window_title_for_typing)
+                        if insertion_success:
+                            final_status_message = "Text inserted."
+                        else:
+                            final_status_message = "Error inserting text."
+                    else: # Transcribed text was empty after strip
+                        final_status_message = "Transcription was empty."
+                else: # Transcription itself failed or returned an error string
+                    final_status_message = transcribed_text if transcribed_text else "Transcription failed: Unknown error."
+                
+            self.app_state.update_status(final_status_message, is_recording=False) # Single final status update for this cycle
             
-            # self._update_tray_feedback()
-            # Reset keys for next full press sequence
-            self.currently_pressed_keys.clear()
-
-
-        return True # Keep listener running unless exit_requested
+            self.currently_pressed_keys.clear() # Fully reset for next press combo
+        return True
 
     def run_listener(self):
         print("HotkeyManager: Starting keyboard listener...")
@@ -181,35 +167,37 @@ class HotkeyManager:
             self.app_state.update_status(f"Listener Error: {e}")
             # self._update_tray_feedback()
 
-
-    def start(self):
+    def start(self): # Called when app starts or "Enable Hotkeys" is checked
         if self.listener_thread and self.listener_thread.is_alive():
             print("HotkeyManager: Listener already running.")
+            # Ensure stream is open if listening is re-enabled
+            if not self.audio_recorder._stream_is_open: # Accessing internal flag, better to have a public property or handle in open_stream
+                print("HotkeyManager: Audio stream was closed, reopening...")
+                self.audio_recorder.open_stream()
             return
         
-        # Reset states before starting
         self.app_state.exit_requested = False 
         self.currently_pressed_keys.clear()
         self._hotkey_active_and_recording = False
+        
+        print("HotkeyManager: Opening audio stream for pre-warming...")
+        if not self.audio_recorder.open_stream(): # Open stream when starting listener
+            self.app_state.update_status("Error: Mic stream failed to open.", is_recording=False)
+            return # Don't start listener if stream fails
 
         self.listener_thread = threading.Thread(target=self.run_listener, daemon=True)
         self.listener_thread.start()
 
-    def stop(self):
+    def stop(self): # Called on exit or when "Enable Hotkeys" is unchecked
         print("HotkeyManager: Stop requested.")
-        self.app_state.exit_requested = True # Signal run_listener loop to exit
+        self.app_state.exit_requested = True 
         if self.pynput_listener:
-            print("HotkeyManager: Stopping pynput listener...")
-            try:
-                # This might not be strictly necessary if the thread exits cleanly,
-                # but good for explicit cleanup.
-                self.pynput_listener.stop() # Tell the listener to stop
-            except Exception as e:
-                print(f"HotkeyManager: Error stopping pynput listener: {e}")
+            try: self.pynput_listener.stop()
+            except Exception as e: print(f"HotkeyManager: Error stopping pynput listener: {e}")
         
         if self.listener_thread and self.listener_thread.is_alive():
-            print("HotkeyManager: Waiting for listener thread to join...")
-            self.listener_thread.join(timeout=1.0) # Wait for thread to finish
-            if self.listener_thread.is_alive():
-                print("HotkeyManager WARN: Listener thread did not join in time.")
+            self.listener_thread.join(timeout=1.0)
+        
+        print("HotkeyManager: Closing audio stream...")
+        self.audio_recorder.close_stream() # Close stream when stopping
         print("HotkeyManager: Stopped.")

@@ -1,0 +1,19 @@
+pystray>=0.19.0
+Pillow>=9.0.0
+pynput>=1.7.0
+sounddevice>=0.4.6 
+scipy>=1.7.0
+numpy>=1.20.0
+SpeechRecognition>=3.10.0
+# For offline STT with CMU Sphinx:
+# On Windows, 'pip install pocketsphinx' can be tricky.
+# Try 'pip install pocketsphinx-binary' if available for your Python version/platform.
+# Alternatively, ensure you have C++ build tools and SWIG installed if building from source.
+# pocketsphinx-binary 
+# OR if you build pocketsphinx from source, list its direct requirements if any not covered.
+# If pocketsphinx-binary is not used, users may need to install pocketsphinx manually.
+# PyAudio is often a dependency of SpeechRecognition, but sounddevice is handling mic input.
+# However, SpeechRecognition might still use it for AudioFile processing or if its own mic functions were used.
+# Including it to be safe, but it might be omittable if no issues arise.
+PyAudio>=0.2.11
+pyautogui>=0.9.50
